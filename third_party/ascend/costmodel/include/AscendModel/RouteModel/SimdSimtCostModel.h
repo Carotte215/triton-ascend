@@ -16,6 +16,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,9 +31,6 @@ enum class SimdSimtCandidateKind {
 
 llvm::StringRef stringifySimdSimtCandidate(SimdSimtCandidateKind candidate);
 
-/// Resource summary for the exact non-overlapping TTIR operations that the
-/// current materializer can wrap in local SIMT scopes.  It intentionally
-/// contains no Operation pointers, so reports remain stable and serializable.
 struct SimtAnchorFeatureSummary {
   int64_t count = 0;
   std::vector<TriangularSolveFacts> triangularSolves;
@@ -41,13 +39,10 @@ struct SimtAnchorFeatureSummary {
   llvm::json::Object toJSON() const;
 };
 
-/// Kernel-level facts needed before Stage partitioning.  Operation workload
-/// belongs to StageFeatureAnalysis/StageWorkloadAnalysis and is intentionally
-/// not duplicated here.
+/// Kernel-level facts needed before Stage partitioning.
 struct SimdSimtFeatureSummary {
   /// Scheduling/layout facts read from the transformed TTIR consumed by this
-  /// model.  These make it explicit that layout merging and AutoBlockify V1
-  /// ran before feature extraction rather than being guessed from source TTIR.
+  /// model.
   bool autoBlockifyV1Applied = false;
   bool hasExplicitScope = false;
 
@@ -71,9 +66,11 @@ struct SimdSimtCostModelOptions {
   std::string actualTarget;
   unsigned numWarps = 32;
   bool includeFeaturesInJSON = true;
+  /// Full Stage implementation matrices are diagnostic-only.
+  bool includeDiagnosticStageDetailsInJSON = true;
+  bool collectCalibrationEstimates = true;
   /// True only when the target backend can materialize the shared TTIR anchor
-  /// plan.  Candidate costs remain reportable when false, but mixed is not
-  /// eligible for selection.
+  /// plan.
   bool compileOn91095 = false;
   /// True when backend integration can wrap a mixed local scope with the
   /// AutoBlockify V1 logical-program schedule for factors greater than one.
@@ -85,15 +82,24 @@ struct SimdSimtCostModelOptions {
   int64_t maximumWholeKernelSuperblockFactor = 64;
   /// Largest factor accepted by the outlined local-scope backend contract.
   int64_t maximumScopeSuperblockFactor = 4;
-  /// Optional runtime launch count. Zero means unknown; a positive value
-  /// prevents the solver from pricing factors that cannot form one full
-  /// logical-program group.
+  /// Optional runtime launch count.
   int64_t logicalProgramCountHint = 0;
+  /// Launch count before AutoBlockify V1 row coalescing.
+  int64_t sourceLogicalProgramCountHint = 0;
   int64_t physicalVectorCoreCountHint = 0;
+  int64_t physicalAiCoreCountHint = 0;
+  /// Backend CV payload partition capability; one when binding is disabled.
+  int64_t cvAivSubblocks = 1;
+  /// Backend capability sets, intersected with structural/resource legality.
+  /// Empty explicitly disables the corresponding SIMT implementations.
+  std::vector<int64_t> wholeKernelSuperblockFactors = {1, 2, 4};
+  std::vector<int64_t> scopeSuperblockFactors = {1, 2, 4};
+  /// A backend resource pass can invalidate the pre-register-allocation winner.
+  std::optional<SimdSimtCandidateKind> backendForcedDecision;
 };
 
 struct SimdSimtCostReport {
-  int64_t schemaVersion = 14;
+  int64_t schemaVersion = 21;
   std::string model = "ascend_stage_route_cost_v3_cpp";
   std::string profileVersion;
   std::string profileTarget;
@@ -104,7 +110,45 @@ struct SimdSimtCostReport {
   std::string microbenchmarkProfileTarget;
   std::string microbenchmarkProfileContentSha256;
   std::string scoreUnit;
+  int64_t kernelArgumentCount = 0;
+  int64_t logicalProgramCountHint = 0;
+  int64_t sourceLogicalProgramCountHint = 0;
+  /// Compiler-derived Stage resources before the one-time route envelope.
   SimdSimtCandidateScores candidateCosts;
+  SimdSimtCandidateScores candidateElapsedCosts;
+  /// Absolute elapsed-time prediction for the selected route.
+  struct SelectedRouteElapsedPrediction {
+    bool applied = false;
+    std::string reason = "no_structural_route_elapsed_calibration";
+    std::string calibrationName;
+    std::string candidate;
+    std::string dotUseSignature;
+    std::string formula;
+    std::string evidence;
+    int64_t superblockFactor = 1;
+    int64_t baseWarpCount = 0;
+    int64_t runtimeSchedulingSlotCount = 0;
+    int64_t minimumRuntimeSchedulingSlotCount = 0;
+    int64_t maximumRuntimeSchedulingSlotCount = 0;
+    int64_t minimumRuntimeLoopIterations = 0;
+    int64_t maximumRuntimeLoopIterations = 0;
+    double minimumSelectionScore = 0.0;
+    double maximumSelectionScore = 0.0;
+    double selectionScoreScale = 0.0;
+    double schedulingSlotScale = 0.0;
+    double fixedSystemCycles = 0.0;
+    int64_t runtimeKernelArgumentCount = 0;
+    double runtimeArgumentSetupSystemCycles = 0.0;
+    /// Accounting split of the measured route-independent kernel boundary.
+    double scalarPrologueSystemCycles = 0.0;
+    double scalarEpilogueSystemCycles = 0.0;
+    double systemCounterFrequencyMHz = 0.0;
+    double baseSelectionScore = 0.0;
+    double predictedSystemCounterCycles = 0.0;
+    double predictedMicroseconds = 0.0;
+
+    llvm::json::Object toJSON() const;
+  } selectedRouteElapsed;
   bool allSimdCandidateLegal = true;
   bool allSimtOnlyCandidateLegal = true;
   bool mixedCandidateLegal = false;
@@ -114,6 +158,7 @@ struct SimdSimtCostReport {
   SimdSimtFeatureSummary features;
   StageCostModelSummary stageModel;
   bool includeFeaturesInJSON = true;
+  bool includeDiagnosticStageDetailsInJSON = true;
 
   llvm::json::Object toJSON() const;
   void printJSON(llvm::raw_ostream &os, bool pretty = true) const;
@@ -127,9 +172,7 @@ std::string getDefaultSimdSimtProfilePath();
 llvm::Expected<SimdSimtFeatureSummary>
 analyzeSimdSimtFeatures(mlir::ModuleOp module, bool compileOn91095 = true);
 
-/// Analyze using a caller-owned immutable plan.  Selector uses this overload
-/// so the exact operations charged by the mixed score are the operations later
-/// marked for materialization.
+/// Analyze using a caller-owned immutable plan.
 llvm::Expected<SimdSimtFeatureSummary>
 analyzeSimdSimtFeatures(mlir::ModuleOp module,
                         const SimtAnchorPlan &anchorPlan);

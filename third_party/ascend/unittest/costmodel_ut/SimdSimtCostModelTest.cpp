@@ -12,6 +12,7 @@
 using mlir::ascend::HardwareProfile;
 using mlir::ascend::LogicalStage;
 using mlir::ascend::LogicalStageCost;
+using mlir::ascend::ScopeHandoffCost;
 using mlir::ascend::SimdSimtFeatureSummary;
 using mlir::ascend::solveStageRoutes;
 using mlir::ascend::StageCostEvaluator;
@@ -25,7 +26,6 @@ using mlir::ascend::StagePartition;
 using mlir::ascend::StagePartitioner;
 using mlir::ascend::StagePartitionerOptions;
 using mlir::ascend::StageScheduleKind;
-using mlir::ascend::StageTransitionCost;
 using mlir::ascend::StageWorkload;
 using mlir::ascend::StageWorkloadAnalysis;
 using mlir::ascend::TensorOperationWorkload;
@@ -50,7 +50,7 @@ SimdSimtFeatureSummary triangularBt16StageFeatures() {
 
 namespace {
 
-HardwareProfile hardwareProfile(StageTransitionCost transition = {}) {
+HardwareProfile hardwareProfile(ScopeHandoffCost scopeHandoff = {}) {
   HardwareProfile profile;
   profile.profileVersion = "unit-test-profile-v1";
   profile.target = "Ascend950PR_9579";
@@ -74,7 +74,6 @@ HardwareProfile hardwareProfile(StageTransitionCost transition = {}) {
     mode.shuffleLanesPerCycle = 32.0;
     mode.dotSetupCycles = 8.0;
     mode.dotFlopsPerCycle = 64.0;
-    mode.scalarOperationsPerCycle = 1.0;
     mode.issueOperationsPerCycle = 4.0;
     mode.spillTransactionsPerCycle = 1.0;
     mode.indirectLoadTransactionsPerCycle = 0.5;
@@ -88,7 +87,7 @@ HardwareProfile hardwareProfile(StageTransitionCost transition = {}) {
   profile.simt.vectorWidth = 1;
   profile.simt.vectorWidthBits = 1;
   profile.simt.issueWidth = 32;
-  profile.transition = std::move(transition);
+  profile.scopeHandoff = std::move(scopeHandoff);
   return profile;
 }
 
@@ -105,7 +104,7 @@ logicalStage(llvm::StringRef id, StageCostModelKind kind,
   stage.simtLegal = true;
   stage.legalSimtFactors = {1};
   stage.workload.paysKernelSetup = true;
-  stage.workload.operationElements["f32.add"] = 64.0;
+  stage.workload.operationCounts["f32.add"][64] = 1.0;
   stage.workload.issueElements = 4.0;
   return stage;
 }
@@ -137,8 +136,9 @@ TEST(SimdSimtCostModelTest, SimdPricesShortAxesPerSegmentAndElementWidth) {
                      double segmentCount) {
     LogicalStage stage =
         logicalStage("short-axis", StageCostModelKind::ScalarMath);
-    stage.workload.operationElements["f32.add"] =
-        static_cast<double>(contiguousElements) * segmentCount;
+    stage.workload.operationCounts.clear();
+    stage.workload
+        .operationCounts["f32.add"][contiguousElements * segmentCount] = 1.0;
     TensorOperationWorkload tensor;
     tensor.operation = "f32.add";
     tensor.elementBitWidth = elementBits;
@@ -414,8 +414,8 @@ TEST(SimdSimtCostModelTest, KernelMixedRouteComesFromAdjacentStageModes) {
   addStage("payload", 100.0, 50.0);
   addStage("store", 30.0, 45.0);
 
-  StageTransitionCost transition;
-  transition.fixedPairCycles = 12.0;
+  ScopeHandoffCost transition;
+  transition.fixedScopeCycles = 12.0;
   auto result = solveStageRoutes(table, transition);
   if (!result)
     FAIL() << llvm::toString(result.takeError());
@@ -426,8 +426,8 @@ TEST(SimdSimtCostModelTest, KernelMixedRouteComesFromAdjacentStageModes) {
   EXPECT_EQ(result->mixed.implementations[0].mode, StageMode::SIMD);
   EXPECT_EQ(result->mixed.implementations[1].mode, StageMode::SIMT);
   EXPECT_EQ(result->mixed.implementations[2].mode, StageMode::SIMD);
-  ASSERT_EQ(result->mixed.entryTransitionCycles.size(), 3u);
-  EXPECT_DOUBLE_EQ(result->mixed.entryTransitionCycles[1], 12.0);
+  ASSERT_EQ(result->mixed.scopeHandoffCycles.size(), 3u);
+  EXPECT_DOUBLE_EQ(result->mixed.scopeHandoffCycles[1], 12.0);
 }
 
 TEST(SimdSimtCostModelTest, MixedScopePaysExactBidirectionalUbHandoffCost) {
@@ -447,7 +447,6 @@ TEST(SimdSimtCostModelTest, MixedScopePaysExactBidirectionalUbHandoffCost) {
   payload.id = "large_result_payload";
   payload.localSimtMaterializable = true;
   payload.localSimtFactors = {1};
-  payload.localSimtScopeCount = 2;
   payload.scopeInputTensorBytes = 4096;
   payload.scopeOutputTensorBytes = 16384;
   payload.implementations = {makeCost(StageMode::SIMD, 100.0),
@@ -457,12 +456,9 @@ TEST(SimdSimtCostModelTest, MixedScopePaysExactBidirectionalUbHandoffCost) {
   tail.id = "tail";
   table.stages = {head, payload, tail};
 
-  StageTransitionCost transition;
-  transition.simdUbLoadBytesPerCycle = 512.0;
-  transition.simdUbStoreBytesPerCycle = 256.0;
-  transition.simtUbLoadBytesPerThreadPerCycle = 4.0;
-  transition.simtUbStoreBytesPerThreadPerCycle = 4.0;
-  transition.simtWarpSize = 32;
+  ScopeHandoffCost transition;
+  transition.inputHandoffBytesPerCycle = 4096.0 / 48.0;
+  transition.outputHandoffBytesPerCycle = 16384.0 / 160.0;
   auto routes = solveStageRoutes(table, transition);
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
@@ -471,10 +467,10 @@ TEST(SimdSimtCostModelTest, MixedScopePaysExactBidirectionalUbHandoffCost) {
   // Output: 16384/(4*32) + 16384/512 = 160 cycles.
   // Head/payload/tail: 10 + (10 + 208) + 10 = 238 cycles.
   EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 238.0);
-  ASSERT_EQ(routes->mixed.entryTransitionCycles.size(), 3u);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[0], 0.0);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 208.0);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[2], 0.0);
+  ASSERT_EQ(routes->mixed.scopeHandoffCycles.size(), 3u);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[0], 0.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[1], 208.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[2], 0.0);
   EXPECT_GT(routes->mixed.totalCycles, routes->allSimd.totalCycles);
 }
 
@@ -498,7 +494,6 @@ TEST(SimdSimtCostModelTest, MixedScopeSuperBlockAmortizesOnlyFixedTransitions) {
   payload.id = "payload";
   payload.localSimtMaterializable = true;
   payload.localSimtFactors = {1, 2, 4};
-  payload.localSimtScopeCount = 1;
   payload.scopeInputTensorBytes = 4096;
   payload.scopeOutputTensorBytes = 4096;
   payload.implementations = {makeCost(StageMode::SIMD, 1, 1000.0),
@@ -511,13 +506,10 @@ TEST(SimdSimtCostModelTest, MixedScopeSuperBlockAmortizesOnlyFixedTransitions) {
   tail.id = "tail";
   table.stages = {head, payload, tail};
 
-  StageTransitionCost transition;
-  transition.fixedPairCycles = 80.0;
-  transition.simdUbLoadBytesPerCycle = 512.0;
-  transition.simdUbStoreBytesPerCycle = 256.0;
-  transition.simtUbLoadBytesPerThreadPerCycle = 4.0;
-  transition.simtUbStoreBytesPerThreadPerCycle = 4.0;
-  transition.simtWarpSize = 32;
+  ScopeHandoffCost transition;
+  transition.fixedScopeCycles = 80.0;
+  transition.inputHandoffBytesPerCycle = 4096.0 / 48.0;
+  transition.outputHandoffBytesPerCycle = 4096.0 / 40.0;
   auto routes = solveStageRoutes(table, transition);
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
@@ -528,14 +520,14 @@ TEST(SimdSimtCostModelTest, MixedScopeSuperBlockAmortizesOnlyFixedTransitions) {
   // 4096-byte input/output handoff remains 48 + 40 cycles per program.
   EXPECT_DOUBLE_EQ(routes->mixed.totalCycles,
                    10.0 + 100.0 + 20.0 + 48.0 + 40.0 + 10.0);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 108.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[1], 108.0);
 }
 
 TEST(SimdSimtCostModelTest, PrefixScanUsesModeSpecificDependencyFactor) {
   LogicalStage stage = logicalStage("scan", StageCostModelKind::PrefixScan);
   stage.features.hasReduction = true;
   stage.features.hasPrefixScan = true;
-  stage.workload.operationElements.clear();
+  stage.workload.operationCounts.clear();
   stage.workload.scalarOperations = 0.0;
   stage.workload.issueElements = 64.0;
   stage.workload.shuffleLaneSteps = 320.0;
@@ -562,13 +554,13 @@ TEST(SimdSimtCostModelTest, LoopCarriedRecurrenceAppliesScanDependencyFactor) {
     stage.features.hasLoop = true;
     stage.features.hasLoopCarriedDataDependency = true;
     stage.features.hasPrefixScan = true;
-    stage.workload.operationElements.clear();
+    stage.workload.operationCounts.clear();
     stage.workload.scalarOperations = 0.0;
     stage.workload.issueElements = 64.0;
     // Mixed shuffle pool: 320 scan-class steps (tt.scan) + 320 reduce-class
     // steps (tt.reduce).
     stage.workload.shuffleLaneSteps = 640.0;
-    stage.workload.scanShuffleLaneSteps = 320.0;
+    stage.workload.prefixScanCounts[{32, 10, 1, 1, false, "add"}] = 1.0;
     return stage;
   };
 
@@ -604,7 +596,7 @@ TEST(SimdSimtCostModelTest, LoopCarriedRecurrenceAppliesScanDependencyFactor) {
   // A recurrence whose shuffle pool is purely reduce-class must not consume
   // the scan factor even though the scan feature flag is set.
   LogicalStage reduceOnlyStage = buildStage();
-  reduceOnlyStage.workload.scanShuffleLaneSteps = 0.0;
+  reduceOnlyStage.workload.prefixScanCounts.clear();
   auto reduceOnlyScaled =
       evaluateOneStage(std::move(reduceOnlyStage), scanProfile);
   if (!reduceOnlyScaled)
@@ -649,7 +641,7 @@ TEST(SimdSimtCostModelTest, SimdCubeStageUsesCvPipelineCriticalPath) {
                    StageScheduleKind::IndependentPipelined, 4);
   stage.features.hasDot = true;
   stage.features.hasContiguousMemory = true;
-  stage.workload.operationElements.clear();
+  stage.workload.operationCounts.clear();
   stage.workload.scalarOperations = 16.0;
   stage.workload.loadBytes = 2048.0;
   stage.workload.storeBytes = 512.0;
@@ -726,7 +718,7 @@ TEST(SimdSimtCostModelTest, RecurrenceAccumulatesCriticalPathAndTraffic) {
 
   stage.workload.loadWarpInstructions = 10.0;
   stage.workload.storeWarpInstructions = 5.0;
-  stage.workload.estimatedSpillTransactions = 7.0;
+  stage.workload.privateStackLoadInstructions = 7.0;
 
   auto table = evaluateOneStage(stage);
   if (!table)
@@ -781,7 +773,7 @@ TEST(SimdSimtCostModelTest,
   EXPECT_GE(costs[2].totalCycles,
             costs[2].resources.setup + 16.0 * costs[2].resources.issue);
 
-  stage.workload.estimatedSpillTransactions = 32.0;
+  stage.workload.privateStackLoadInstructions = 32.0;
   auto spillingTable = evaluateOneStage(stage);
   if (!spillingTable)
     FAIL() << llvm::toString(spillingTable.takeError());
@@ -827,8 +819,7 @@ TEST(SimdSimtCostModelTest, IndirectMemoryUsesDependencyProfile) {
   stage.features.hasIndirectMemory = true;
   stage.workload.loadBytes = 1024.0;
   stage.workload.loadWarpInstructions = 8.0;
-  stage.workload.indirectLoadBytes = 1024.0;
-  stage.workload.indirectLoadTransactions = 8.0;
+  stage.workload.indirectLoadCounts[{1024, 256}] = 1.0;
 
   HardwareProfile profile = hardwareProfile();
   profile.simd.indirectLoadTransactionsPerCycle = 0.25;
@@ -964,7 +955,7 @@ TEST(SimdSimtCostModelTest, MixedRouteRejectsUnmaterializableSimtStage) {
   payload.implementations = {makeCost(StageMode::SIMD, 100.0),
                              makeCost(StageMode::SIMT, 1.0)};
   table.stages = {head, payload};
-  auto routes = solveStageRoutes(table, StageTransitionCost{});
+  auto routes = solveStageRoutes(table, ScopeHandoffCost{});
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
   EXPECT_TRUE(routes->allSimt.legal);
@@ -985,7 +976,6 @@ TEST(SimdSimtCostModelTest,
   mlir::ascend::LogicalStageCost gather;
   gather.id = "indirect_tile_gather";
   gather.localSimtMaterializable = true;
-  gather.localSimtScopeCount = 1;
   gather.implementations = {makeCost(StageMode::SIMD, 100.0),
                             makeCost(StageMode::SIMT, 130.0),
                             makeCost(StageMode::SIMT, 130.0, true)};
@@ -995,8 +985,8 @@ TEST(SimdSimtCostModelTest,
                          makeCost(StageMode::SIMT, 90.0)};
   table.stages = {gather, dot};
 
-  StageTransitionCost transition;
-  transition.fixedPairCycles = 20.0;
+  ScopeHandoffCost transition;
+  transition.fixedScopeCycles = 20.0;
   auto routes = solveStageRoutes(table, transition);
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
@@ -1030,7 +1020,7 @@ TEST(SimdSimtCostModelTest, AllSimdDoesNotPayRouteConditionalAutoBlockify) {
                              makeCost(StageMode::SIMT, 80.0)};
   table.stages = {dispatch, payload};
 
-  auto routes = solveStageRoutes(table, StageTransitionCost{});
+  auto routes = solveStageRoutes(table, ScopeHandoffCost{});
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
   ASSERT_TRUE(routes->allSimd.legal);
@@ -1067,7 +1057,7 @@ TEST(SimdSimtCostModelTest, AllSimdPreservesSetupOnConditionalSchedule) {
       payload.implementations = {makeCost(StageMode::SIMD, 100.0, 0.0),
                                  makeCost(StageMode::SIMT, 80.0, 0.0)};
       table.stages = {dispatch, payload};
-      auto routes = solveStageRoutes(table, StageTransitionCost{});
+      auto routes = solveStageRoutes(table, ScopeHandoffCost{});
       if (!routes)
         FAIL() << llvm::toString(routes.takeError());
       const double waves = (programs + 1) / 2;
@@ -1083,7 +1073,7 @@ TEST(SimdSimtCostModelTest, AllSimdPreservesSetupOnConditionalSchedule) {
       table.stages[0].implementations[0].totalCycles -= 20.0;
       table.stages[1].implementations[0].resources.setup = 20.0;
       table.stages[1].implementations[0].totalCycles += 20.0;
-      auto moved = solveStageRoutes(table, StageTransitionCost{});
+      auto moved = solveStageRoutes(table, ScopeHandoffCost{});
       if (!moved)
         FAIL() << llvm::toString(moved.takeError());
       EXPECT_DOUBLE_EQ(moved->allSimd.totalCycles, routes->allSimd.totalCycles);
@@ -1108,7 +1098,6 @@ TEST(SimdSimtCostModelTest, MixedRouteChargesEveryMaterializedScope) {
   gather.id = "two_anchor_gather";
   gather.localSimtMaterializable = true;
   gather.localSimtFactors = {1};
-  gather.localSimtScopeCount = 2;
   gather.implementations = {makeCost(StageMode::SIMD, 100.0),
                             makeCost(StageMode::SIMT, 1.0),
                             makeCost(StageMode::SIMT, 1.0, true)};
@@ -1116,8 +1105,8 @@ TEST(SimdSimtCostModelTest, MixedRouteChargesEveryMaterializedScope) {
   tail.id = "tail";
   table.stages = {head, gather, tail};
 
-  StageTransitionCost transition;
-  transition.fixedPairCycles = 20.0;
+  ScopeHandoffCost transition;
+  transition.fixedScopeCycles = 20.0;
   auto routes = solveStageRoutes(table, transition);
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
@@ -1125,8 +1114,8 @@ TEST(SimdSimtCostModelTest, MixedRouteChargesEveryMaterializedScope) {
   // 1 SIMD head + (10 enter + 1 payload + 20 extra scope pair) +
   // (10 leave + 1 SIMD tail).
   EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 43.0);
-  ASSERT_EQ(routes->mixed.entryTransitionCycles.size(), 3u);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 40.0);
+  ASSERT_EQ(routes->mixed.scopeHandoffCycles.size(), 3u);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[1], 40.0);
 }
 
 TEST(SimdSimtCostModelTest, SuperBlockLatencyHidingStopsAtUsefulFactorLimit) {
@@ -1143,7 +1132,7 @@ TEST(SimdSimtCostModelTest, SuperBlockLatencyHidingStopsAtUsefulFactorLimit) {
     FAIL() << llvm::toString(table.takeError());
   table->logicalProgramCountHint = 64;
   table->physicalCoreCountHint = 32;
-  auto routes = solveStageRoutes(*table, cappedProfile.transition);
+  auto routes = solveStageRoutes(*table, cappedProfile.scopeHandoff);
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
   EXPECT_TRUE(routes->allSimt.legal);
@@ -1171,7 +1160,7 @@ TEST(SimdSimtCostModelTest, PureSimtRouteUsesOneUniformSuperBlockFactor) {
                             makeCost(4, 1.0)};
   table.stages = {first, second};
 
-  auto routes = solveStageRoutes(table, StageTransitionCost{});
+  auto routes = solveStageRoutes(table, ScopeHandoffCost{});
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
   ASSERT_TRUE(routes->allSimt.legal);
@@ -1217,7 +1206,7 @@ TEST(SimdSimtCostModelTest, MixedScopeSuperBlockUsesSelectedFactorCost) {
   payload.localSimtFactors = {1, 2, 4};
   table.stages = {prefix, payload};
 
-  auto routes = solveStageRoutes(table, StageTransitionCost{});
+  auto routes = solveStageRoutes(table, ScopeHandoffCost{});
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
   ASSERT_TRUE(routes->mixed.legal);
@@ -1239,9 +1228,8 @@ TEST(SimdSimtCostModelTest,
 
   LogicalStageCost first;
   first.id = "first_local_candidate";
-  first.features.replicatedByLocalSuperBlock = true;
+  first.features.insideAutoBlockifyV1Loop = true;
   first.localSimtMaterializable = true;
-  first.localSimtScopeCount = 1;
   first.implementations = {makeCost(StageMode::SIMD, 1, 100.0),
                            makeCost(StageMode::SIMT, 4, 1.0, true)};
   LogicalStageCost second = first;
@@ -1251,7 +1239,7 @@ TEST(SimdSimtCostModelTest,
   tail.implementations = {makeCost(StageMode::SIMD, 1, 1.0)};
   table.stages = {first, second, tail};
 
-  auto routes = solveStageRoutes(table, StageTransitionCost{});
+  auto routes = solveStageRoutes(table, ScopeHandoffCost{});
   if (!routes)
     FAIL() << llvm::toString(routes.takeError());
   ASSERT_TRUE(routes->mixed.legal);
@@ -1265,9 +1253,9 @@ TEST(SimdSimtCostModelTest,
   // One scope is SIMT (1 cycle); the other Stage remains SIMD and is cloned
   // once per grouped logical program (100 * F4); the outside tail is not.
   EXPECT_DOUBLE_EQ(routes->mixed.totalCycles, 402.0);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[0], 0.0);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[1], 0.0);
-  EXPECT_DOUBLE_EQ(routes->mixed.entryTransitionCycles[2], 0.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[0], 0.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[1], 0.0);
+  EXPECT_DOUBLE_EQ(routes->mixed.scopeHandoffCycles[2], 0.0);
 }
 
 TEST(SimdSimtCostModelTest,
@@ -1343,9 +1331,9 @@ TEST(SimdSimtCostModelTest,
   // The arith.addf is the scf.for body and therefore represents 256 element
   // additions on every one of the 14 dynamic recurrence iterations.  The
   // per-iteration Stage workload must remain 256, not be divided by 14.
-  auto add = recurrenceStage->workload.operationElements.find("f32.add");
-  ASSERT_NE(add, recurrenceStage->workload.operationElements.end());
-  EXPECT_DOUBLE_EQ(add->second, 256.0);
+  auto add = recurrenceStage->workload.operationCounts.find("f32.add");
+  ASSERT_NE(add, recurrenceStage->workload.operationCounts.end());
+  EXPECT_DOUBLE_EQ(add->second.at(256), 1.0);
 }
 
 TEST(SimdSimtCostModelTest,

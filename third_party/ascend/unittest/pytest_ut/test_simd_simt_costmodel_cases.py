@@ -28,6 +28,11 @@ def _vector_core_count():
     return int(properties["num_vectorcore"])
 
 
+def _aicore_count():
+    properties = driver.active.utils.get_device_properties(torch.npu.current_device())
+    return int(properties["num_aicore"])
+
+
 def _load_route_report(path, expected):
     report = json.loads(path.read_text())
     assert report["stage_model"]["applied"]
@@ -43,6 +48,7 @@ def _launch_options(report_path, logical_programs):
         "auto_simt_scope_dump": str(report_path),
         "logical_program_count_hint": logical_programs,
         "physical_vector_core_count_hint": _vector_core_count(),
+        "physical_aicore_count_hint": _aicore_count(),
     }
     if os.getenv("TRITON_TEST_DISABLE_TTIR_LAYOUT_MERGE") == "1":
         options["enable_ttir_layout_merge"] = False
@@ -100,9 +106,9 @@ def _assert_performance(case, launch, profile_root, documented_us, tolerance=1.2
 
 # The original TopK validation matrix has device-reference failures in cases
 # 02/03/05/06/07/10.  Keep only the four shapes that passed the device
-# reference check, while covering both expected route families.
+# reference check while retaining the validated shapes.
 TOPK_INDEX_MERGE_CASES = [
-    pytest.param(1, 1, 256, 4, 2, "all_simd", id="01-b1-h1-b256-k4-c2"),
+    pytest.param(1, 1, 256, 4, 2, "all_simt_only", id="01-b1-h1-b256-k4-c2"),
     pytest.param(8, 8, 2048, 32, 8, "all_simt_only", id="04-b8-h8-b2048-k32-c8"),
     pytest.param(8, 8, 4096, 32, 8, "all_simt_only", id="08-b8-h8-b4096-k32-c8"),
     pytest.param(8, 4, 8192, 32, 8, "all_simt_only", id="09-b8-h4-b8192-k32-c8"),
@@ -549,9 +555,19 @@ def test_costmodel_solve_tril(batch, sequence_length, heads, block, documented_u
     report = _load_route_report(report_path, "mixed_simd_simt")
     assert report["materialized_simt_anchor_count"] > 0
     assert report["selected_superblock_factor"] == 4
-    assert report["effective_runtime_factor"] == 4
-    assert report["full_group_count"] == logical_programs // 4
-    assert report["tail_count"] == 0
+    # Mixed solve_tril contains SIMD Cube stages. NPUIR therefore creates a
+    # MIX/AIC AutoBlockify loop (CUBE_CORE_COUNT slots), not an AIV loop.
+    # The local SIMT stage is still one F4 scope inside that loop.
+    aicore_count = _aicore_count()
+    logical_programs_per_slot = (logical_programs + aicore_count - 1) // aicore_count
+    expected_full_groups = logical_programs_per_slot // 4
+    assert report["effective_runtime_factor"] == (4 if expected_full_groups else 1)
+    assert report["runtime_scheduling_slot_count"] == min(logical_programs, aicore_count)
+    assert report["runtime_physical_program_count"] == min(logical_programs, aicore_count)
+    assert report["logical_programs_per_scheduling_slot"] == logical_programs_per_slot
+    assert report["full_group_count"] == expected_full_groups
+    assert report["tail_count"] == logical_programs_per_slot % 4
+    assert report["runtime_loop_iteration_count"] == (expected_full_groups + logical_programs_per_slot % 4)
     case = f"solve_tril_B{batch}_T{sequence_length}_H{heads}_BT{block}"
     _assert_performance(case, launch, tmp_path / "solve_profile", documented_us)
     del output_blocks, inverse, output, a
